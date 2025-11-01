@@ -1,0 +1,49 @@
+name: Build merged ICS
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"   # alle 15 Minuten
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install icalendar pytz requests
+      - name: Merge ICS
+        env:
+          ICS_URL_A: ${{ secrets.ICS_URL_A }}
+          ICS_URL_B: ${{ secrets.ICS_URL_B }}
+        run: python merge_ics.py
+      - name: Check output
+        run: ls -lah docs && test -f docs/merged.ics
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
