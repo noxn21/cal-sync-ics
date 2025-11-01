@@ -1,84 +1,142 @@
-import os, re, uuid, requests, datetime
+import os, re, requests, datetime
 from icalendar import Calendar, Event
-from pytz import UTC
+from typing import List, Tuple
+
+# --- Konfiguration: Quellen + Label ---
+SOURCES: List[Tuple[str, str]] = [
+    ("ICS_URL_A", "Julian busy"),
+    ("ICS_URL_B", "Noah busy"),
+    ("ICS_URL_C", "Julian Uni"),
+]
+
+HORIZON_DAYS = 120  # wie weit in die Zukunft exportiert wird
 
 def fetch_ics(url: str) -> Calendar:
-    # iCloud webcal:// -> https://
     url = re.sub(r'^webcal://', 'https://', url.strip())
     r = requests.get(url, timeout=30)
     r.raise_for_status()
     return Calendar.from_ical(r.content)
 
-def to_busy_blocks(events):
-    now = datetime.datetime.now(UTC)
-    horizon = now + datetime.timedelta(days=120)  # 4 Monate
-    blocks = []
-    for ev in events:
-        if ev.name != "VEVENT":
-            continue
-        dtstart = ev.get('dtstart')
-        dtend = ev.get('dtend') or ev.get('duration')
-        if not dtstart:
-            continue
-        start = dtstart.dt
-        end = (dtend.dt if hasattr(dtend, 'dt') else None) if dtend else None
-        if not end:
-            end = start + datetime.timedelta(hours=1)
-        # All-day normalisieren
-        if isinstance(start, datetime.date) and not isinstance(start, datetime.datetime):
-            start = datetime.datetime.combine(start, datetime.time.min).replace(tzinfo=UTC)
-        if isinstance(end, datetime.date) and not isinstance(end, datetime.datetime):
-            end = datetime.datetime.combine(end, datetime.time.min).replace(tzinfo=UTC)
-        # TZ -> UTC
-        start = start if getattr(start, 'tzinfo', None) else start.replace(tzinfo=UTC)
-        end   = end   if getattr(end, 'tzinfo', None)   else end.replace(tzinfo=UTC)
-        start = start.astimezone(UTC)
-        end   = end.astimezone(UTC)
-        if end <= now or start >= horizon:
-            continue
-        blocks.append((start, end))
-    return blocks
+def is_all_day(component) -> bool:
+    """
+    All-day wenn:
+    - DTSTART hat VALUE=DATE-Parameter ODER
+    - dtstart.dt ist ein datetime.date (ohne Uhrzeit)
+    """
+    dtstart = component.get('dtstart')
+    if not dtstart:
+        return False
+    # VALUE=DATE gesetzt?
+    try:
+        val = dtstart.params.get('VALUE')
+        if val and str(val).upper() == 'DATE':
+            return True
+    except Exception:
+        pass
+    # Python-Typ checken
+    return isinstance(dtstart.dt, datetime.date) and not isinstance(dtstart.dt, datetime.datetime)
 
-def merge_overlaps(blocks):
-    if not blocks: return []
-    blocks = sorted(blocks, key=lambda x: x[0])
-    merged = [blocks[0]]
-    for s, e in blocks[1:]:
-        ls, le = merged[-1]
-        if s <= le:
-            merged[-1] = (ls, max(le, e))
+def norm_all_day_bounds(component) -> Tuple[datetime.date, datetime.date]:
+    """
+    Liefert (start_date, end_date_exclusive) für ganztägige Events.
+    Falls DTEND fehlt, setzen wir end = start + 1 Tag (iCal-Standard).
+    """
+    ds = component.get('dtstart').dt  # date-Objekt oder datetime->date
+    if isinstance(ds, datetime.datetime):
+        ds = ds.date()
+    dtend = component.get('dtend')
+    if dtend:
+        de = dtend.dt
+        if isinstance(de, datetime.datetime):
+            de = de.date()
+    else:
+        de = ds + datetime.timedelta(days=1)
+    return ds, de
+
+def norm_timed_bounds(component) -> Tuple[datetime.datetime, datetime.datetime]:
+    """
+    Start/Ende für terminierte (nicht ganztägige) Events. Wir übernehmen Timezones wie geliefert,
+    ohne auf UTC zu zwängen (vermeidet 01:00-Verschiebungen).
+    Falls DTEND fehlt: +1h.
+    """
+    start = component.get('dtstart').dt
+    dtend = component.get('dtend')
+    if dtend:
+        end = dtend.dt
+    else:
+        # Fallback 1h
+        if isinstance(start, datetime.datetime):
+            end = start + datetime.timedelta(hours=1)
         else:
-            merged.append((s, e))
-    return merged
+            end = (datetime.datetime.combine(start, datetime.time.min) +
+                   datetime.timedelta(hours=1))
+    return start, end
 
 def main():
-    urls = [os.environ['ICS_URL_A'], os.environ['ICS_URL_B']]
-    all_blocks = []
-    for u in urls:
-        cal = fetch_ics(u)
-        events = [c for c in cal.walk() if c.name == "VEVENT"]
-        all_blocks.extend(to_busy_blocks(events))
-
-    merged = merge_overlaps(all_blocks)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    horizon = now + datetime.timedelta(days=HORIZON_DAYS)
 
     out = Calendar()
-    out.add('prodid', '-//Team Availability Merge//juno//')
+    out.add('prodid', '-//Team Availability Merge (labeled)//noah//')
     out.add('version', '2.0')
-    out.add('name', 'Team Availability (Merged)')
-    out.add('X-WR-CALNAME', 'Team Availability (Merged)')
-    out.add('X-WR-TIMEZONE', 'UTC')
+    out.add('name', 'Team Availability (Labeled)')
+    out.add('X-WR-CALNAME', 'Team Availability (Labeled)')
 
-    now = datetime.datetime.now(UTC)
+    # Für jede Quelle Events holen und 1:1 (mit neuem Summary) in den Output schreiben
+    for env_key, label in SOURCES:
+        url = os.environ.get(env_key)
+        if not url:
+            continue
+        cal = fetch_ics(url)
+
+        for comp in cal.walk():
+            if comp.name != "VEVENT":
+                continue
+
+            try:
+                if is_all_day(comp):
+                    start_date, end_date = norm_all_day_bounds(comp)
+
+                    # Filter Fenster (als Datum betrachten)
+                    if end_date <= now.date() or start_date >= (now + datetime.timedelta(days=HORIZON_DAYS)).date():
+                        continue
+
+                    ev = Event()
+                    # All-day korrekt: VALUE=DATE + exklusives DTEND
+                    ev.add('dtstart', start_date, parameters={'VALUE': 'DATE'})
+                    ev.add('dtend', end_date, parameters={'VALUE': 'DATE'})
+                    ev.add('summary', label)
+
+                else:
+                    start_dt, end_dt = norm_timed_bounds(comp)
+
+                    # Filter Fenster (mit Zeitzone, ggf. naive → lokal annehmen)
+                    # Für robusten Vergleich in UTC normalisieren, falls tz-naiv:
+                    def to_utc(dt: datetime.datetime) -> datetime.datetime:
+                        if isinstance(dt, datetime.date) and not isinstance(dt, datetime.datetime):
+                            dt = datetime.datetime.combine(dt, datetime.time.min)
+                        if dt.tzinfo is None:
+                            # naive → lokale Annahme + in UTC
+                            return dt.replace(tzinfo=datetime.timezone.utc)
+                        return dt.astimezone(datetime.timezone.utc)
+
+                    if to_utc(end_dt) <= now or to_utc(start_dt) >= horizon:
+                        continue
+
+                    ev = Event()
+                    # Zeiten unverändert übernehmen (keine Zwangs-UTC, vermeidet 01:00-Sprünge)
+                    ev.add('dtstart', start_dt)
+                    ev.add('dtend', end_dt)
+                    ev.add('summary', label)
+
+                out.add_component(ev)
+
+            except Exception:
+                # Schluckt kaputte Einzel-Events, damit der Gesamtlauf nicht scheitert
+                continue
+
+    # Ausgeben
     os.makedirs('docs', exist_ok=True)
-    for start, end in merged:
-        ev = Event()
-        ev.add('uid', f'{uuid.uuid4()}@team-availability')
-        ev.add('dtstamp', now)
-        ev.add('dtstart', start)
-        ev.add('dtend', end)
-        ev.add('summary', 'Busy')  # Datenschutz: keine Details
-        out.add_component(ev)
-
     with open('docs/merged.ics', 'wb') as f:
         f.write(out.to_ical())
 
