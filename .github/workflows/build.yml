@@ -3,7 +3,7 @@ name: Build merged ICS
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"   # alle 15 Minuten
+    - cron: "*/5 * * * *"   # alle 5 Minuten
   push:
     branches: [main]
 
